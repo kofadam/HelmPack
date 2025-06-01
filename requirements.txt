@@ -1,0 +1,5 @@
+click>=8.0.0
+pyyaml>=6.0
+docker>=6.0.0
+requests>=2.25.0
+ruamel.yaml>=0.17.0
