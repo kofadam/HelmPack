@@ -435,6 +435,8 @@ class HelmPackBundler:
         
         bundle_name = f"{chart_info.name}-{chart_info.version}.helmpack.tgz"
         if output_path:
+            # Create output directory if it doesn't exist
+            os.makedirs(output_path, exist_ok=True)
             bundle_path = os.path.join(output_path, bundle_name)
         else:
             bundle_path = bundle_name
@@ -452,11 +454,17 @@ class HelmPackBundler:
                     "version": chart_info.version,
                     "generatedAt": subprocess.run(['date', '-Iseconds'], 
                                                 capture_output=True, text=True).stdout.strip(),
-                    "generatedBy": "HelmPack Universal Bundler"
+                    "generatedBy": "HelmPack Universal Bundler",
+                    "bundlePath": bundle_path,
+                    "totalImages": len(chart_info.images),
+                    "totalDependencies": len(chart_info.dependencies)
                 },
                 "chart": asdict(chart_info),
                 "images": [asdict(img) for img in chart_info.images]
             }
+            
+            # Ensure bundle directory exists
+            os.makedirs(bundle_dir, exist_ok=True)
             
             with open(os.path.join(bundle_dir, "bundle.yaml"), 'w') as f:
                 yaml.safe_dump(metadata, f, default_flow_style=False)
