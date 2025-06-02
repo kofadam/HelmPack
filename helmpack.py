@@ -521,11 +521,16 @@ class HelmPackBundler:
 class HelmPackImporter:
     """Imports bundles into air-gapped environments."""
     
-    def __init__(self, harbor_url: str, harbor_username: str, harbor_password: str):
+    def __init__(self, harbor_url: str, harbor_username: str, harbor_password: str, insecure: bool = False):
         self.harbor_url = harbor_url.rstrip('/')
         self.harbor_username = harbor_username
         self.harbor_password = harbor_password
+        self.insecure = insecure
         self.docker_client = None
+        
+        if insecure:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
     def __enter__(self):
         try:
@@ -800,10 +805,11 @@ def bundle(chart, output, no_images, include_signatures):
 @click.option('--harbor-user', required=True, help='Harbor username')
 @click.option('--harbor-password', required=True, help='Harbor password')
 @click.option('--project', default='library', help='Harbor project name')
-def import_bundle(bundle_path, harbor_url, harbor_user, harbor_password, project):
+@click.option('--insecure', is_flag=True, help='Skip SSL certificate verification')
+def import_bundle(bundle_path, harbor_url, harbor_user, harbor_password, project, insecure):
     """Import a bundle into Harbor registry for air-gapped deployment."""
     try:
-        with HelmPackImporter(harbor_url, harbor_user, harbor_password) as importer:
+        with HelmPackImporter(harbor_url, harbor_user, harbor_password, insecure) as importer:
             importer.import_bundle(bundle_path, project)
             
             click.echo("\n" + "="*60)
@@ -930,43 +936,77 @@ def info(bundle_path):
 @click.option('--harbor-url', required=True, help='Harbor registry URL')
 @click.option('--harbor-user', required=True, help='Harbor username')
 @click.option('--harbor-password', required=True, help='Harbor password')
-def test_harbor(harbor_url, harbor_user, harbor_password):
+@click.option('--insecure', is_flag=True, help='Skip SSL certificate verification')
+def test_harbor(harbor_url, harbor_user, harbor_password, insecure):
     """Test connectivity to Harbor registry."""
     try:
         # Test Harbor API
         harbor_host = harbor_url.rstrip('/')
         api_url = f"{harbor_host}/api/v2.0/systeminfo"
         
+        # Configure SSL verification
+        verify_ssl = not insecure
+        if insecure:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            click.echo("⚠️  SSL certificate verification disabled")
+        
         response = requests.get(
             api_url,
             auth=(harbor_user, harbor_password),
-            timeout=10
+            timeout=10,
+            verify=verify_ssl
         )
         
         if response.status_code == 200:
             click.echo(f"✅ Harbor API connection successful")
             system_info = response.json()
             click.echo(f"Harbor Version: {system_info.get('harbor_version', 'Unknown')}")
+            click.echo(f"Registry URL: {system_info.get('registry_url', 'Unknown')}")
         else:
             click.echo(f"❌ Harbor API connection failed: {response.status_code}")
+            if response.text:
+                click.echo(f"Response: {response.text}")
             return
         
         # Test Docker registry login
         try:
             docker_client = docker_from_env()
+            
+            # For self-signed certs, we might need to configure Docker daemon
+            registry_host = harbor_host.split('://')[-1]
+            
             docker_client.login(
                 username=harbor_user,
                 password=harbor_password,
-                registry=harbor_host.split('://')[-1]
+                registry=registry_host
             )
             click.echo(f"✅ Docker registry login successful")
+            
+            if insecure:
+                click.echo("\n💡 Note: For Docker to work with self-signed certificates:")
+                click.echo(f"   Add '{registry_host}' to Docker daemon's insecure-registries")
+                click.echo("   or install the certificate in Docker's trust store")
+                
         except Exception as e:
             click.echo(f"❌ Docker registry login failed: {e}")
+            if "certificate" in str(e).lower() or "ssl" in str(e).lower():
+                registry_host = harbor_host.split('://')[-1]
+                click.echo(f"\n💡 For self-signed certificates, configure Docker:")
+                click.echo(f"   1. Add to /etc/docker/daemon.json:")
+                click.echo(f'      {{"insecure-registries": ["{registry_host}"]}}')
+                click.echo(f"   2. Restart Docker: sudo systemctl restart docker")
+                click.echo(f"   3. Or copy certificate to: /etc/docker/certs.d/{registry_host}/ca.crt")
         
         click.echo(f"\n🎉 Harbor connectivity test completed!")
         
     except Exception as e:
-        click.echo(f"❌ Error testing Harbor: {e}", err=True)
+        if "certificate verify failed" in str(e) or "SSL" in str(e):
+            click.echo(f"❌ SSL Certificate Error: {e}")
+            click.echo(f"\n💡 Try again with --insecure flag to skip SSL verification:")
+            click.echo(f"   ./helmpack.py test-harbor --insecure --harbor-url {harbor_url} --harbor-user {harbor_user} --harbor-password ***")
+        else:
+            click.echo(f"❌ Error testing Harbor: {e}", err=True)
         sys.exit(1)
 
 if __name__ == '__main__':
