@@ -694,13 +694,13 @@ class HelmPackImporter:
         """Relocate image references in chart files."""
         logger.info("🔄 Relocating image references...")
         
-        # Update values.yaml files
+        # Update values.yaml files with structured approach
         for values_file in ['values.yaml', 'values.yml']:
             values_path = os.path.join(chart_dir, values_file)
             if os.path.exists(values_path):
-                self._relocate_images_in_file(values_path, image_mapping)
+                self._relocate_images_in_values_file(values_path, image_mapping)
         
-        # Update template files
+        # Update template files with simple replacement
         templates_dir = os.path.join(chart_dir, 'templates')
         if os.path.exists(templates_dir):
             for root, dirs, files in os.walk(templates_dir):
@@ -709,8 +709,164 @@ class HelmPackImporter:
                         file_path = os.path.join(root, file)
                         self._relocate_images_in_file(file_path, image_mapping)
     
+    def _relocate_images_in_values_file(self, values_path: str, image_mapping: dict):
+        """Relocate image references in values.yaml with YAML structure awareness."""
+        try:
+            from ruamel.yaml import YAML
+            yaml = YAML()
+            yaml.preserve_quotes = True
+            yaml.default_flow_style = False
+            
+            with open(values_path, 'r') as f:
+                values = yaml.load(f)
+            
+            if not values:
+                # Fallback to simple replacement
+                self._relocate_images_in_file(values_path, image_mapping)
+                return
+            
+            modified = False
+            
+            def update_image_references(obj, path=""):
+                nonlocal modified
+                
+                if isinstance(obj, dict):
+                    # Pattern 1: Direct image reference
+                    if 'image' in obj and isinstance(obj['image'], str):
+                        original_ref = obj['image'].strip()
+                        if original_ref in image_mapping:
+                            obj['image'] = image_mapping[original_ref]
+                            modified = True
+                            logger.info(f"    Updated image at {path}: {original_ref} -> {image_mapping[original_ref]}")
+                    
+                    # Pattern 2: registry/repository/tag structure (Bitnami style)
+                    if 'registry' in obj and 'repository' in obj:
+                        registry = obj.get('registry', '').strip()
+                        repository = obj.get('repository', '').strip()
+                        tag = obj.get('tag', '').strip()
+                        
+                        if registry and repository:
+                            # Construct the full image reference
+                            if tag:
+                                full_ref = f"{registry}/{repository}:{tag}"
+                            else:
+                                full_ref = f"{registry}/{repository}"
+                            
+                            # Check if this matches any discovered image
+                            if full_ref in image_mapping:
+                                harbor_ref = image_mapping[full_ref]
+                                
+                                # Parse harbor reference: harbor.example.com/project/repo:tag
+                                if '/' in harbor_ref and ':' in harbor_ref:
+                                    # Split harbor.example.com/project/repo:tag
+                                    harbor_host_project, harbor_repo_tag = harbor_ref.split('/', 2)[:2] + [harbor_ref.split('/', 2)[2]]
+                                    harbor_host = harbor_host_project
+                                    
+                                    if '/' in harbor_repo_tag:
+                                        harbor_project_repo, harbor_tag = harbor_repo_tag.rsplit(':', 1) if ':' in harbor_repo_tag else (harbor_repo_tag, tag)
+                                        if '/' in harbor_project_repo:
+                                            harbor_project, harbor_repo = harbor_project_repo.split('/', 1)
+                                        else:
+                                            harbor_project = "library"
+                                            harbor_repo = harbor_project_repo
+                                    else:
+                                        harbor_project = "library"
+                                        harbor_repo, harbor_tag = harbor_repo_tag.rsplit(':', 1) if ':' in harbor_repo_tag else (harbor_repo_tag, tag)
+                                    
+                                    # Parse it properly
+                                    parts = harbor_ref.split('/')
+                                    if len(parts) >= 3:
+                                        harbor_registry = parts[0]
+                                        harbor_project = parts[1]
+                                        harbor_repo_with_tag = '/'.join(parts[2:])
+                                        
+                                        if ':' in harbor_repo_with_tag:
+                                            harbor_repo, harbor_tag = harbor_repo_with_tag.rsplit(':', 1)
+                                        else:
+                                            harbor_repo = harbor_repo_with_tag
+                                            harbor_tag = tag
+                                        
+                                        # Update the structured fields
+                                        obj['registry'] = harbor_registry
+                                        obj['repository'] = f"{harbor_project}/{harbor_repo}"
+                                        if 'tag' in obj:
+                                            obj['tag'] = harbor_tag
+                                        
+                                        modified = True
+                                        logger.info(f"    Updated structured image at {path}:")
+                                        logger.info(f"      registry: {registry} -> {harbor_registry}")
+                                        logger.info(f"      repository: {repository} -> {harbor_project}/{harbor_repo}")
+                                        logger.info(f"      tag: {tag} -> {harbor_tag}")
+                    
+                    # Pattern 3: repository/tag without registry (assumes Docker Hub)
+                    elif 'repository' in obj and 'registry' not in obj:
+                        repository = obj.get('repository', '').strip()
+                        tag = obj.get('tag', '').strip()
+                        
+                        if repository:
+                            # Try docker.io prefix
+                            full_ref = f"docker.io/{repository}:{tag}" if tag else f"docker.io/{repository}"
+                            alt_ref = f"{repository}:{tag}" if tag else repository
+                            
+                            harbor_ref = None
+                            if full_ref in image_mapping:
+                                harbor_ref = image_mapping[full_ref]
+                            elif alt_ref in image_mapping:
+                                harbor_ref = image_mapping[alt_ref]
+                            
+                            if harbor_ref:
+                                # Parse harbor reference
+                                parts = harbor_ref.split('/')
+                                if len(parts) >= 3:
+                                    harbor_registry = parts[0]
+                                    harbor_project = parts[1]
+                                    harbor_repo_with_tag = '/'.join(parts[2:])
+                                    
+                                    if ':' in harbor_repo_with_tag:
+                                        harbor_repo, harbor_tag = harbor_repo_with_tag.rsplit(':', 1)
+                                    else:
+                                        harbor_repo = harbor_repo_with_tag
+                                        harbor_tag = tag
+                                    
+                                    # Add registry field and update repository
+                                    obj['registry'] = harbor_registry
+                                    obj['repository'] = f"{harbor_project}/{harbor_repo}"
+                                    if 'tag' in obj:
+                                        obj['tag'] = harbor_tag
+                                    
+                                    modified = True
+                                    logger.info(f"    Updated repository/tag at {path}:")
+                                    logger.info(f"      added registry: {harbor_registry}")
+                                    logger.info(f"      repository: {repository} -> {harbor_project}/{harbor_repo}")
+                                    logger.info(f"      tag: {tag} -> {harbor_tag}")
+                    
+                    # Recurse into nested objects
+                    for key, value in obj.items():
+                        if isinstance(value, (dict, list)):
+                            update_image_references(value, f"{path}.{key}" if path else key)
+                
+                elif isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        if isinstance(item, (dict, list)):
+                            update_image_references(item, f"{path}[{i}]")
+            
+            update_image_references(values)
+            
+            if modified:
+                with open(values_path, 'w') as f:
+                    yaml.dump(values, f)
+                logger.info(f"  ✅ Updated {values_path}")
+            else:
+                # If no structured updates, try simple replacement as fallback
+                self._relocate_images_in_file(values_path, image_mapping)
+            
+        except Exception as e:
+            logger.warning(f"Failed to relocate images in {values_path}: {e}")
+            # Fallback to simple string replacement
+            self._relocate_images_in_file(values_path, image_mapping)
+    
     def _relocate_images_in_file(self, file_path: str, image_mapping: dict):
-        """Relocate image references in a single file."""
+        """Simple fallback method for image relocation."""
         try:
             with open(file_path, 'r') as f:
                 content = f.read()
