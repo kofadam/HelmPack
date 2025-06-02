@@ -20,12 +20,30 @@ from dataclasses import dataclass, asdict
 from urllib.parse import urlparse
 import click
 import requests
-from docker import from_env as docker_from_env
-from docker.errors import ImageNotFound, APIError
+
+# Optional imports with graceful fallback
+try:
+    from docker import from_env as docker_from_env
+    from docker.errors import ImageNotFound, APIError
+    DOCKER_AVAILABLE = True
+except ImportError:
+    DOCKER_AVAILABLE = False
+    
+    # Create dummy classes for type hints
+    class ImageNotFound(Exception):
+        pass
+    class APIError(Exception):
+        pass
+    
+    def docker_from_env():
+        raise RuntimeError("Docker module not available")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+if not DOCKER_AVAILABLE:
+    logger.warning("⚠️  Docker Python module not available. Image bundling will be limited.")
 
 @dataclass
 class ImageInfo:
@@ -57,10 +75,13 @@ class HelmChartAnalyzer:
         self.temp_dirs: List[str] = []
         
     def __enter__(self):
-        try:
-            self.docker_client = docker_from_env()
-        except Exception as e:
-            logger.warning(f"Docker client not available: {e}")
+        if DOCKER_AVAILABLE:
+            try:
+                self.docker_client = docker_from_env()
+            except Exception as e:
+                logger.warning(f"Docker client not available: {e}")
+        else:
+            logger.warning("Docker module not installed. Image operations will be skipped.")
         return self
         
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -673,11 +694,11 @@ class HelmPackImporter:
         """Relocate image references in chart files."""
         logger.info("🔄 Relocating image references...")
         
-        # Update values.yaml files
+        # Update values.yaml files with structured approach
         for values_file in ['values.yaml', 'values.yml']:
             values_path = os.path.join(chart_dir, values_file)
             if os.path.exists(values_path):
-                self._relocate_images_in_file(values_path, image_mapping)
+                self._relocate_images_in_values_file(values_path, image_mapping)
         
         # Update template files
         templates_dir = os.path.join(chart_dir, 'templates')
@@ -686,10 +707,202 @@ class HelmPackImporter:
                 for file in files:
                     if file.endswith(('.yaml', '.yml')):
                         file_path = os.path.join(root, file)
-                        self._relocate_images_in_file(file_path, image_mapping)
+                        self._relocate_images_in_template_file(file_path, image_mapping)
+        
+        # Update Chart.yaml annotations if they exist
+        chart_yaml_path = os.path.join(chart_dir, 'Chart.yaml')
+        if os.path.exists(chart_yaml_path):
+            self._relocate_images_in_chart_yaml(chart_yaml_path, image_mapping)
+    
+    def _relocate_images_in_values_file(self, values_path: str, image_mapping: dict):
+        """Relocate image references in values.yaml with proper YAML structure handling."""
+        try:
+            from ruamel.yaml import YAML
+            yaml = YAML()
+            yaml.preserve_quotes = True
+            yaml.default_flow_style = False
+            
+            with open(values_path, 'r') as f:
+                values = yaml.load(f)
+            
+            if not values:
+                return
+            
+            modified = False
+            
+            # Common patterns for image references in values.yaml
+            def update_image_references(obj, path=""):
+                nonlocal modified
+                
+                if isinstance(obj, dict):
+                    # Pattern 1: Direct image reference
+                    if 'image' in obj and isinstance(obj['image'], str):
+                        original_ref = obj['image'].strip()
+                        if original_ref in image_mapping:
+                            obj['image'] = image_mapping[original_ref]
+                            modified = True
+                            logger.info(f"    Updated image at {path}.image: {original_ref} -> {image_mapping[original_ref]}")
+                    
+                    # Pattern 2: registry/repository/tag structure
+                    if all(k in obj for k in ['registry', 'repository']) or 'repository' in obj:
+                        registry = obj.get('registry', 'docker.io')
+                        repository = obj.get('repository', '')
+                        tag = obj.get('tag', 'latest')
+                        
+                        # Construct original reference
+                        if registry and repository:
+                            if registry == 'docker.io' and '/' not in repository:
+                                original_ref = f"{repository}:{tag}"
+                            else:
+                                original_ref = f"{registry}/{repository}:{tag}"
+                        elif repository:
+                            original_ref = f"{repository}:{tag}"
+                        else:
+                            original_ref = None
+                        
+                        # Check if this matches any of our discovered images
+                        if original_ref:
+                            for orig_img, harbor_img in image_mapping.items():
+                                if (original_ref == orig_img or 
+                                    original_ref in orig_img or 
+                                    orig_img.endswith(f"/{repository}:{tag}") or
+                                    orig_img.endswith(f"/{repository}") and tag in orig_img):
+                                    
+                                    # Parse harbor reference
+                                    harbor_parts = harbor_img.split('/')
+                                    if len(harbor_parts) >= 3:
+                                        harbor_registry = harbor_parts[0]
+                                        harbor_project = harbor_parts[1]
+                                        harbor_repo_tag = '/'.join(harbor_parts[2:])
+                                        
+                                        if ':' in harbor_repo_tag:
+                                            harbor_repo, harbor_tag = harbor_repo_tag.rsplit(':', 1)
+                                        else:
+                                            harbor_repo = harbor_repo_tag
+                                            harbor_tag = 'latest'
+                                        
+                                        # Update the values
+                                        if 'registry' in obj:
+                                            obj['registry'] = harbor_registry
+                                        if 'repository' in obj:
+                                            obj['repository'] = f"{harbor_project}/{harbor_repo}"
+                                        if 'tag' in obj:
+                                            obj['tag'] = harbor_tag
+                                        
+                                        modified = True
+                                        logger.info(f"    Updated structured image at {path}: {original_ref} -> {harbor_img}")
+                                        break
+                    
+                    # Pattern 3: Check for any string values that match our images
+                    for key, value in obj.items():
+                        if isinstance(value, str) and value.strip() in image_mapping:
+                            obj[key] = image_mapping[value.strip()]
+                            modified = True
+                            logger.info(f"    Updated {path}.{key}: {value} -> {image_mapping[value.strip()]}")
+                        elif isinstance(value, (dict, list)):
+                            update_image_references(value, f"{path}.{key}" if path else key)
+                
+                elif isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        if isinstance(item, (dict, list)):
+                            update_image_references(item, f"{path}[{i}]")
+                        elif isinstance(item, str) and item.strip() in image_mapping:
+                            obj[i] = image_mapping[item.strip()]
+                            modified = True
+                            logger.info(f"    Updated {path}[{i}]: {item} -> {image_mapping[item.strip()]}")
+            
+            update_image_references(values)
+            
+            if modified:
+                with open(values_path, 'w') as f:
+                    yaml.dump(values, f)
+                logger.info(f"  ✅ Updated {values_path}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to relocate images in {values_path}: {e}")
+            # Fallback to simple string replacement
+            self._relocate_images_in_file(values_path, image_mapping)
+    
+    def _relocate_images_in_template_file(self, file_path: str, image_mapping: dict):
+        """Relocate image references in template files."""
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+            
+            modified = False
+            original_content = content
+            
+            # Replace exact matches first
+            for original_ref, harbor_ref in image_mapping.items():
+                if original_ref in content:
+                    content = content.replace(original_ref, harbor_ref)
+                    modified = True
+            
+            # Also look for quoted versions
+            for original_ref, harbor_ref in image_mapping.items():
+                for quote in ['"', "'"]:
+                    quoted_original = f"{quote}{original_ref}{quote}"
+                    quoted_harbor = f"{quote}{harbor_ref}{quote}"
+                    if quoted_original in content:
+                        content = content.replace(quoted_original, quoted_harbor)
+                        modified = True
+            
+            if modified:
+                with open(file_path, 'w') as f:
+                    f.write(content)
+                logger.info(f"  ✅ Updated template {file_path}")
+        
+        except Exception as e:
+            logger.warning(f"Failed to relocate images in template {file_path}: {e}")
+    
+    def _relocate_images_in_chart_yaml(self, chart_yaml_path: str, image_mapping: dict):
+        """Update image references in Chart.yaml annotations."""
+        try:
+            from ruamel.yaml import YAML
+            yaml = YAML()
+            yaml.preserve_quotes = True
+            
+            with open(chart_yaml_path, 'r') as f:
+                chart_yaml = yaml.load(f)
+            
+            if not chart_yaml or 'annotations' not in chart_yaml:
+                return
+            
+            modified = False
+            annotations = chart_yaml['annotations']
+            
+            # Update images annotation
+            if 'images' in annotations:
+                images_str = annotations['images']
+                for original_ref, harbor_ref in image_mapping.items():
+                    if original_ref in images_str:
+                        images_str = images_str.replace(original_ref, harbor_ref)
+                        modified = True
+                
+                if modified:
+                    annotations['images'] = images_str
+            
+            # Update artifacthub.io/images annotation
+            if 'artifacthub.io/images' in annotations:
+                images_str = annotations['artifacthub.io/images']
+                for original_ref, harbor_ref in image_mapping.items():
+                    if original_ref in images_str:
+                        images_str = images_str.replace(original_ref, harbor_ref)
+                        modified = True
+                
+                if modified:
+                    annotations['artifacthub.io/images'] = images_str
+            
+            if modified:
+                with open(chart_yaml_path, 'w') as f:
+                    yaml.dump(chart_yaml, f)
+                logger.info(f"  ✅ Updated Chart.yaml annotations")
+        
+        except Exception as e:
+            logger.warning(f"Failed to relocate images in Chart.yaml: {e}")
     
     def _relocate_images_in_file(self, file_path: str, image_mapping: dict):
-        """Relocate image references in a single file."""
+        """Simple fallback method for image relocation."""
         try:
             with open(file_path, 'r') as f:
                 content = f.read()
@@ -971,22 +1184,26 @@ def test_harbor(harbor_url, harbor_user, harbor_password, insecure):
         
         # Test Docker registry login
         try:
-            docker_client = docker_from_env()
-            
-            # For self-signed certs, we might need to configure Docker daemon
-            registry_host = harbor_host.split('://')[-1]
-            
-            docker_client.login(
-                username=harbor_user,
-                password=harbor_password,
-                registry=registry_host
-            )
-            click.echo(f"✅ Docker registry login successful")
-            
-            if insecure:
-                click.echo("\n💡 Note: For Docker to work with self-signed certificates:")
-                click.echo(f"   Add '{registry_host}' to Docker daemon's insecure-registries")
-                click.echo("   or install the certificate in Docker's trust store")
+            if not DOCKER_AVAILABLE:
+                click.echo("⚠️  Docker Python module not available - skipping Docker registry test")
+                click.echo("💡 To install: pip install docker")
+            else:
+                docker_client = docker_from_env()
+                
+                # For self-signed certs, we might need to configure Docker daemon
+                registry_host = harbor_host.split('://')[-1]
+                
+                docker_client.login(
+                    username=harbor_user,
+                    password=harbor_password,
+                    registry=registry_host
+                )
+                click.echo(f"✅ Docker registry login successful")
+                
+                if insecure:
+                    click.echo("\n💡 Note: For Docker to work with self-signed certificates:")
+                    click.echo(f"   Add '{registry_host}' to Docker daemon's insecure-registries")
+                    click.echo("   or install the certificate in Docker's trust store")
                 
         except Exception as e:
             click.echo(f"❌ Docker registry login failed: {e}")
