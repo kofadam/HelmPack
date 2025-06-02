@@ -730,7 +730,17 @@ class HelmPackImporter:
             
             modified = False
             
-            # Common patterns for image references in values.yaml
+            # Create a reverse mapping from discovered images to repositories
+            repo_mapping = {}
+            for original_ref, harbor_ref in image_mapping.items():
+                # Parse original reference
+                if '/' in original_ref and ':' in original_ref:
+                    repo_part, tag_part = original_ref.rsplit(':', 1)
+                    repo_mapping[repo_part] = harbor_ref
+                
+                # Also map the full reference
+                repo_mapping[original_ref] = harbor_ref
+            
             def update_image_references(obj, path=""):
                 nonlocal modified
                 
@@ -743,55 +753,74 @@ class HelmPackImporter:
                             modified = True
                             logger.info(f"    Updated image at {path}.image: {original_ref} -> {image_mapping[original_ref]}")
                     
-                    # Pattern 2: registry/repository/tag structure
-                    if all(k in obj for k in ['registry', 'repository']) or 'repository' in obj:
-                        registry = obj.get('registry', 'docker.io')
-                        repository = obj.get('repository', '')
-                        tag = obj.get('tag', 'latest')
+                    # Pattern 2: repository/tag structure (like Zabbix chart)
+                    if 'repository' in obj:
+                        repository = obj.get('repository', '').strip()
+                        tag = obj.get('tag')
                         
-                        # Construct original reference
-                        if registry and repository:
-                            if registry == 'docker.io' and '/' not in repository:
-                                original_ref = f"{repository}:{tag}"
+                        if repository:
+                            # Handle cases where tag might be null/None (uses global tag)
+                            tag_str = str(tag) if tag is not None else ""
+                            
+                            # Try to find matching image in our discovered images
+                            matched_harbor_ref = None
+                            
+                            # First, try exact repository match in our mappings
+                            if repository in repo_mapping:
+                                matched_harbor_ref = repo_mapping[repository]
                             else:
-                                original_ref = f"{registry}/{repository}:{tag}"
-                        elif repository:
-                            original_ref = f"{repository}:{tag}"
-                        else:
-                            original_ref = None
-                        
-                        # Check if this matches any of our discovered images
-                        if original_ref:
-                            for orig_img, harbor_img in image_mapping.items():
-                                if (original_ref == orig_img or 
-                                    original_ref in orig_img or 
-                                    orig_img.endswith(f"/{repository}:{tag}") or
-                                    orig_img.endswith(f"/{repository}") and tag in orig_img):
+                                # Try to find by constructing the full reference
+                                if tag_str:
+                                    full_ref = f"{repository}:{tag_str}"
+                                    if full_ref in image_mapping:
+                                        matched_harbor_ref = image_mapping[full_ref]
+                                
+                                # Try partial matching for cases where docker.io is implied
+                                if not matched_harbor_ref:
+                                    for orig_ref, harbor_ref in image_mapping.items():
+                                        # Check if our repository matches the end of discovered image
+                                        if (orig_ref.endswith(f"/{repository}") or 
+                                            orig_ref.startswith(f"{repository}:") or
+                                            orig_ref == repository):
+                                            if not tag_str or tag_str in orig_ref:
+                                                matched_harbor_ref = harbor_ref
+                                                break
+                                        
+                                        # Check for Docker Hub implicit docker.io
+                                        if (orig_ref.startswith("docker.io/") and 
+                                            (orig_ref.endswith(f"/{repository}") or 
+                                             f"/{repository}:" in orig_ref)):
+                                            if not tag_str or tag_str in orig_ref:
+                                                matched_harbor_ref = harbor_ref
+                                                break
+                            
+                            # If we found a match, update the repository and tag
+                            if matched_harbor_ref:
+                                # Parse harbor reference to extract new repository and tag
+                                harbor_parts = matched_harbor_ref.split('/')
+                                if len(harbor_parts) >= 3:
+                                    harbor_registry = harbor_parts[0]
+                                    harbor_project = harbor_parts[1]
+                                    harbor_repo_tag = '/'.join(harbor_parts[2:])
                                     
-                                    # Parse harbor reference
-                                    harbor_parts = harbor_img.split('/')
-                                    if len(harbor_parts) >= 3:
-                                        harbor_registry = harbor_parts[0]
-                                        harbor_project = harbor_parts[1]
-                                        harbor_repo_tag = '/'.join(harbor_parts[2:])
-                                        
-                                        if ':' in harbor_repo_tag:
-                                            harbor_repo, harbor_tag = harbor_repo_tag.rsplit(':', 1)
-                                        else:
-                                            harbor_repo = harbor_repo_tag
-                                            harbor_tag = 'latest'
-                                        
-                                        # Update the values
-                                        if 'registry' in obj:
-                                            obj['registry'] = harbor_registry
-                                        if 'repository' in obj:
-                                            obj['repository'] = f"{harbor_project}/{harbor_repo}"
-                                        if 'tag' in obj:
-                                            obj['tag'] = harbor_tag
-                                        
-                                        modified = True
-                                        logger.info(f"    Updated structured image at {path}: {original_ref} -> {harbor_img}")
-                                        break
+                                    if ':' in harbor_repo_tag:
+                                        harbor_repo, harbor_tag = harbor_repo_tag.rsplit(':', 1)
+                                    else:
+                                        harbor_repo = harbor_repo_tag
+                                        harbor_tag = tag_str if tag_str else 'latest'
+                                    
+                                    # Update values
+                                    old_repo = repository
+                                    new_repo = f"{harbor_project}/{harbor_repo}"
+                                    
+                                    obj['repository'] = new_repo
+                                    if 'tag' in obj or tag_str:
+                                        obj['tag'] = harbor_tag
+                                    
+                                    modified = True
+                                    logger.info(f"    Updated repository at {path}: {old_repo} -> {new_repo}")
+                                    if tag_str and harbor_tag != tag_str:
+                                        logger.info(f"    Updated tag at {path}: {tag_str} -> {harbor_tag}")
                     
                     # Pattern 3: Check for any string values that match our images
                     for key, value in obj.items():
